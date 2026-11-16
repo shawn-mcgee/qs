@@ -27,7 +27,7 @@ Every rule in this document follows from these. When a new question comes up, an
 | `str` | text | `string` |
 | `list` | growable, untyped sequence | `any[]` |
 | `dict` | string-keyed map | plain object without `__type__` |
-| `ref` | handle to engine-owned, non-serializable data | `{ __type__: "__ref__", type: string, uuid: string }` |
+| `ref` | handle to engine-owned, non-serializable data | `{ __type__: "__ref__", __kind__: string, __uuid__: string }` |
 | `fn` | function | `{ __type__: "__fn__", __uuid__: string }` |
 | `sh` | shader | `{ __type__: "__sh__", __uuid__: string }` |
 
@@ -45,7 +45,7 @@ Typed values mirror wgsl types and can be passed into shaders, except bool vecto
 | `vec2u`, `vec3u`, `vec4u` | `vec2u` ... | same shape |
 | `vec2b`, `vec3b`, `vec4b` | `vec2<bool>` ... | same shape, with booleans; shader-internal only |
 | `mat2`, `mat3`, `mat4` | `mat2x2f` ... | `{ __type__: "__mat2__", data: [1, 0, 0, 1] }`, column-major |
-| `tex1d`, `tex2d`, `tex3d` | `texture_2d<f32>` ... | `{ __type__: "__tex2d__", w: 512, h: 512, data: ref }` |
+| `tex1d`, `tex2d`, `tex3d` | `texture_2d<f32>` ... | `{ __type__: "__tex2d__", w: 512, h: 512, data: ref }`; `tex1d` has only `w`, and `tex3d` adds `d` |
 | `[T]`, `[T;N]` (arrays) | `array<T, N>` | `{ __type__: "__array__", type: "f32", length: 3, items: [1, 2, 3] }` |
 
 Array items use the plain representation of their element type: numbers for scalars, and vector objects for vectors.
@@ -70,46 +70,90 @@ set ys.0 9         # xs is now [9 2 3]
 
 ### Serialization
 
-Every value serializes to json as its js representation. A `ref` lets state point at engine-owned data while staying plain.
+Every value serializes to json as its js representation. A `ref` lets state point at engine-owned data while staying plain. Its `__kind__` names what it points at, such as `"image"`, and its `__uuid__` identifies it.
+
+json cannot hold `NaN`, `Infinity`, `-Infinity` or `-0`. Wherever a number would be written, including inside typed values, these are written as a tagged object instead and restored when loaded, so every value round-trips exactly. The tag exists only in json: in memory they are ordinary js numbers.
+
+```json
+{ "__type__": "__float__", "value": "NaN" }
+{ "__type__": "__vec2f__", "x": 1, "y": { "__type__": "__float__", "value": "-Infinity" } }
+```
+
+`value` is one of `"NaN"`, `"Infinity"`, `"-Infinity"` or `"-0"`.
 
 A `fn` or `sh` serializes as just its `__type__` and `__uuid__`; a closure's captured variables are not serialized. A serialized function can only be rehydrated while the application still holds the live function with that `__uuid__`. Rehydrating one that no longer exists is an error.
+
+The `__uuid__` names where the function is defined: its script's path and its position in that script. It is therefore stable across page reloads while the source is unchanged. If the source is edited, the positions can move and saved functions may no longer rehydrate. Every closure created by the same `fn` or `sh` shares one `__uuid__`. Such closures are equal under `is`, and rehydrating a serialized one gives the most recently created live one.
+
+```json
+{ "__type__": "__fn__", "__uuid__": "game/player.qs:12:14" }
+```
 
 ## Syntax
 
 ### Application
 
-Function application is the one fundamental shape. These are all equivalent:
+Function application is the one fundamental shape. As in lisp, an application is a head followed by its arguments. Parens around a whole line are optional, and so are commas between arguments. These are all equivalent:
 
 ```qs
-foo(a, b)
-foo a, b
-foo(a b)
+(foo a b)
 foo a b
+foo a, b
+(foo a, b)
 ```
 
-Arguments are never called; parens group an application.
+Parens always group, and whitespace around them never changes the meaning: `foo(a b)` is the same as `foo (a b)`. Elsewhere, whitespace matters only for [`-`](#arithmetic) and for prefixes and suffixes that must touch their operand: `:T`, `...` and `$"`. Arguments are never called. A group is a single argument, and its value is the result of its own application.
 
 ```qs
-foo a bar b c      # foo(a, bar, b, c)
-foo a (bar b c)    # foo(a, bar(b, c))
+foo a bar b c      # 4 arguments: a, bar, b and c
+foo a (bar b c)    # 2 arguments: a and the result of (bar b c)
+foo(a b)           # 1 argument: the result of (a b)
+```
+
+Since `foo(a b)` reads like a C-style call but means something else, the compiler warns when `(` directly follows a name or a `)`. The meaning is unchanged. `.(` computed keys are exempt.
+
+```qs
+on render(draw_frame)  # warning: this calls draw_frame now; did you mean `on render draw_frame`?
+add(1, 2)              # warning: this applies 1 to 2; did you mean `add 1 2`?
+```
+
+The head can be any expression. A group in head position is evaluated, and its result is applied to the remaining arguments.
+
+```qs
+((make_adder 1) 2) # 3
+(make_adder 1) 2   # 3: the outer parens are optional
+(foo a) + b        # infix, not application: the result of (foo a), plus b
 ```
 
 Commas control arity: an empty slot is `nil`, and trailing commas are optional.
 
 ```qs
-foo a ,, b         # foo(a, nil, b)
-foo a b ,,         # foo(a, b, nil)
+foo a ,, b         # 3 arguments: a, nil and b
+foo a b ,,         # 3 arguments: a, b and nil
+foo, a b           # a comma after the head only separates: 2 arguments, a and b
+foo ,, a           # 2 arguments: nil and a
+(, a)              # error: no head
 ```
 
-A lone name is a call. A name that is a whole expression on its own, or alone inside parens, is applied with no arguments. A lone name that refers to a non-function evaluates to its value. Use `get` to get a function itself in a lone position.
+An empty group `()` is a compile-time error, since an application needs a head. `foo()` is therefore an error too. To call a function with no arguments, write `foo` or `(foo)`. To pass nothing, write `nil`. The one place `()` is allowed is an empty parameter list, `fn () ...`, because a parameter list is a pattern and is never applied.
+
+An application with no arguments still applies its head. If the head's value is a function, it is called with no arguments; otherwise the application evaluates to that value. This holds for any head: a name, a path or a group. Use `get` to get a function itself in a lone position.
+
+A line is an application, and parens around the whole line belong to it, so `(foo a)` and `foo a` are the same line. Each further pair of parens is another application, so it can add another call.
 
 ```qs
 foo                # calls foo
-foo()              # calls foo
+(foo)              # calls foo: the same line
+m.bump             # calls m.bump
 let x (foo)        # binds the result of calling foo
 let f foo          # foo is an argument: f is the function itself
 { get foo }        # a block evaluating to the function foo
 { x }              # the value of x, when x is not a function
+
+(make_adder 1)     # the adder function
+((make_adder 1))   # calls the adder with no arguments
+fn (x) x           # returns x
+fn (x) (x)         # calls x if it is a function
 ```
 
 ### Lines and blocks
@@ -134,6 +178,33 @@ Identifiers contain ASCII letters, digits and underscores, cannot start with a d
 
 Reserved words: `let`, `set`, `fn`, `sh`, `if`, `elif`, `else`, `while`, `each`, `and`, `or`, `return`, `break`, `continue`, `import`, `on`, `nil`, `true`, `false`. These are special forms or literals. Every other built-in is an ordinary binding and can be shadowed.
 
+### Special forms
+
+Special forms look like calls, but each has a fixed shape. A function ignores extra arguments; a special form rejects missing or extra operands with a compile-time error. Arguments are never called, so an application used as an operand needs parens.
+
+| form | shape |
+| --- | --- |
+| `let` | `let name value`, or `let name:T value` |
+| `set` | `set target value` |
+| `fn`, `sh` | `fn params body` |
+| `if` | `if cond branch`, then any number of `elif cond branch`, then at most one `else branch` |
+| `while` | `while cond body` |
+| `each` | `each pattern a body`, with up to two more arguments before the body (see [Counting](#counting)) |
+| `return` | `return`, or `return value` |
+| `break`, `continue` | no operands |
+| `import` | `import path` |
+| `on` | `on name handler` |
+
+```qs
+if not done { ... }      # error: if takes a condition and a branch
+if (not done) { ... }
+while (lt i n) { ... }
+let x add 1 2            # error: let takes one value
+let x (add 1 2)
+fn (x) foo x             # error: fn takes one body
+fn (x) (foo x)
+```
+
 ## Literals
 
 ### Nil and bools
@@ -156,7 +227,16 @@ A suffixed literal whose value does not fit its type, such as `0xffffffff:i32`, 
 
 ### Strings
 
-Strings use double quotes and js escapes: `\n`, `\t`, `\"` and `\\`. Braces in a plain string have no special meaning.
+Strings use double quotes. The escapes are `\n`, `\t`, `\r`, `\0`, `\"`, `\\` and `\u{hex}` for any Unicode code point. Any other backslash sequence is a compile-time error. Braces in a plain string have no special meaning.
+
+A string may span lines, and its newlines are kept as written. A newline inside a string does not end the expression.
+
+```qs
+"caf\u{e9}"        # café
+let msg "line one
+line two"
+"\q"               # error: unknown escape
+```
 
 A string prefixed with `$` is interpolated: `{expr}` inside it is evaluated and inserted. The expression may contain plain string literals, but not other interpolated strings. A non-str value is inserted in its `qs` source form, e.g. `nil`, `1.5:f32`, `vec2f 1 2`, `[1 2 3]`. In an interpolated string, `\{` writes a literal brace.
 
@@ -187,7 +267,7 @@ Square brackets make a list. Inside brackets, whitespace separates elements rath
 Angle brackets make a vector. Items follow list rules. Vector items are flattened: each contributes its components in order. The size is the total component count, which must be 2, 3 or 4.
 
 ```qs
-<1 2>              # vec2i
+<1 2>              # vec2f
 <1.5 2 3>          # vec3f
 <v.xy 1>           # 3 components, from a vector and a scalar
 <a.xy b.xy>        # 4 components
@@ -198,7 +278,7 @@ The component type is inferred:
 
 - Typed components must all have the same type, and the vector takes it. Mixing types is an error.
 - `num` components adapt to that type.
-- If every component is a `num`, the vector is `f32` if any is written with a decimal point or exponent, otherwise `i32`. A `u32` vector is never inferred from `num`s.
+- If every component is a `num`, the vector is `f32`, as in glsl. Positions and colors are the common case. An integer vector needs a type, from a typed component or a suffix: `<1 2>:vec2i`.
 
 A vector type suffix names the type, so it converts mixed components. The suffix's size must match the literal's.
 
@@ -235,13 +315,21 @@ mat2 1 2 3 4
 mat2 <1 2> <3 4>
 ```
 
-Angle brackets never make a matrix: `<<1 2> <3 4>>` is a `vec4i`.
+Angle brackets never make a matrix: `<<1 2> <3 4>>` is a `vec4f`.
 
 ## Bindings and functions
 
 ### Bindings
 
 `let` declares a name and `set` reassigns it. Scope is lexical. Declaring a name twice in the same scope is an error, and so is `set` on an undeclared name. `let` can shadow an outer scope's name.
+
+`let` and `set` take exactly one value, as [special forms](#special-forms) have fixed shapes. An application used as the value needs parens:
+
+```qs
+let x add 1 2      # error: let takes one value; write (add 1 2)
+let x (add 1 2)    # 3
+let f add          # the function add itself
+```
 
 `let` can take a type, written like a parameter annotation. It is checked at runtime on the host and at compile time in shaders.
 
@@ -251,9 +339,19 @@ set x 6
 let speed:f32 2
 ```
 
+Any type name can be an annotation, including host types such as `str`, `list`, `dict` and `fn`. An annotation with a wgsl type converts numbers, as described under [Coercion](#coercion). An annotation with a host type only checks, since there is nothing to convert. Shaders accept only wgsl types.
+
+An annotated binding or parameter never holds `nil`. A missing argument to an annotated parameter is therefore an error. To accept `nil`, leave the parameter unannotated.
+
+```qs
+let name:str "qs"
+let scores:list []
+let greet (fn (who:str times:i32) { ... })
+```
+
 ### Functions
 
-`fn` takes a parameter list, then any number of body expressions. A function returns its last body expression; `return` exits early. Functions are named with `let`.
+`fn` takes a parameter list, then exactly one body. Use a block for several expressions. A function returns its body's value; `return` exits early. Functions are named with `let`.
 
 ```qs
 let add (fn (a b) (a + b))
@@ -305,6 +403,8 @@ each (, i) fruits { ... }
 | --- | --- | --- |
 | list, array | each item | index |
 | dict | each value, in insertion order | key |
+| str | each code point, as a one-code-point str | code point position, not UTF-16 offset |
+| `nil` | nothing: zero iterations, on the host | |
 | vector | each component | index |
 | matrix | each column | index |
 | number | each whole number from `0` up to, but not including, it | iteration count |
@@ -329,7 +429,7 @@ These are ordinary arguments: they are evaluated once, before the loop, and the 
 
 **Counting is in whole numbers.** The start, end and step must be whole: this is checked at compile time for literals and at runtime for host variables. For fractions, convert the counter: `(f32 i) / 10`.
 
-**The counter's type follows vector inference, without floats:**
+**The counter's type is an integer type, or a whole `num`:**
 
 - A typed start, end or step names the type, which must be `i32` or `u32`. Mixing types is an error.
 - `num`s adapt to that type. A `u32` count may still have a negative step, which counts down.
@@ -373,19 +473,28 @@ each x xs ,, -1 { ... }    # every item, last to first
 The only infix operators are `+`, `-`, `*` and `/`. They bind tighter than application. `.` (access) binds tightest, then prefix `-`, then `*` `/`, then `+` `-`, all left-associative.
 
 ```qs
-foo a + b          # foo(a + b)
-(foo a) + b
+foo a + b          # 1 argument: a + b
+(foo a) + b        # the result of (foo a), plus b
 ```
 
 Whitespace is optional, except for `-`. A `-` is negation when it follows another operator (`+ - * /`), an opening bracket, or a comma, or when it has whitespace before it and none after it. Any other `-` is subtraction.
 
 ```qs
 a-b                # subtraction
-foo a -7           # foo(a, -7)
-foo a - 7          # foo(a - 7)
+foo a -7           # 2 arguments: a and -7 (with a warning, see below)
+foo a - 7          # 1 argument: a - 7
 a - -b             # a minus negative b
 each i 10 -2 -1    # 10 down to -1
 [-1 2]             # starts with negation
+```
+
+The compiler warns when a negation directly follows a name, path or group, since that is usually a mistyped subtraction. A comma silences the warning, and so does spacing the `-` as subtraction. A negation after a literal or a comma is silent.
+
+```qs
+each i n -1 { ... }    # warning: start n, end -1. Did you mean n - 1?
+foo a -b               # warning: write foo a, -b or a - b
+foo a, -b              # 2 arguments, no warning
+each i 10 0 -1 { ... } # no warning: -1 follows a literal
 ```
 
 Arithmetic applies to numbers, vectors and matrices, following wgsl (`mat * vec` is linear algebra). `+` does not concatenate; strs and lists are joined with `cat`.
@@ -397,16 +506,42 @@ Everything else is a prefix function.
 | function | meaning |
 | --- | --- |
 | `and`, `or`, `xor`, `not` | logic |
-| `is` | equality |
+| `is` | deep equality |
+| `eq` | component-wise equality, as in wgsl |
 | `lt`, `lte`, `gt`, `gte` | comparison |
-| `mod`, `pow` | modulo, exponentiation |
+| `mod`, `rem` | floored modulo, truncated remainder |
+| `pow` | exponentiation |
 | `band`, `bor`, `bxor`, `bnot`, `shl`, `shr` | bitwise, on `i32` and `u32` |
 
 `and` and `or` are special forms: they short-circuit and evaluate to an operand. `xor` evaluates to the one truthy operand, or `false`. The shift amount of `shl` and `shr` is a `u32`, as in wgsl.
 
+When every operand is a `num`, bitwise operations follow js rules and return a `num`: operands are truncated to signed 32-bit integers, and `shr` is js's sign-preserving `>>`. In shaders, such expressions are only possible between literals, which fold at compile time like any other `num` expression.
+
+```qs
+band 5 3           # 1
+bnot 0             # -1
+band 5:u32 3       # 1:u32: 3 adapts to u32
+```
+
+`mod` floors, as in glsl: the result has the sign of the divisor, which is what wrapping angles and tiling need. `rem` truncates, like wgsl's and js's `%`: the result has the sign of the dividend.
+
+```qs
+mod -1 3           # 2
+rem -1 3           # -1
+mod -0.25 1        # 0.75
+```
+
 `is` compares deeply and returns a `bool`. Two different typed scalars, such as `is 1:i32 1:f32`, are an error; inside lists and dicts, different types are simply unequal. `ref`s, `fn`s and `sh`s compare by uuid.
 
 `lt`, `lte`, `gt` and `gte` on vectors compare component-wise and return a bool vector. Reduce it with `any` or `all`.
+
+`is` deliberately differs from wgsl's `==`: it always means "the same value" and returns one `bool`, even for vectors. `eq` is wgsl's `==`. It takes numbers, vectors and bools, compares component-wise, and returns a bool vector for vectors.
+
+```qs
+is <1 2> <1 3>             # false
+eq <1 2> <1 3>             # vec2b: true false
+select a b (eq u v)        # per component
+```
 
 ### Truthiness
 
@@ -418,7 +553,7 @@ A bool vector condition is truthy if any component is `true`.
 
 ### Coercion
 
-**Only `num` is coerced by operations.** Arithmetic, comparisons, logic and bitwise operations on two different typed scalars are compile-time errors, as in wgsl. A `num` operand adapts to the typed operand.
+**Only `num` is coerced by operations.** Arithmetic, comparisons, logic and bitwise operations on two different typed scalars are errors, as in wgsl. A `num` operand adapts to the typed operand.
 
 ```qs
 x + i              # error: f32 + i32
@@ -432,10 +567,17 @@ x * 0.5            # 0.5 adapts to f32
 ```qs
 f32 i              # explicit conversion
 vec2f i j          # the constructor converts
-pow 2:i32 3        # wgsl pow takes floats: pow(f32(2), 3.0)
+pow (f32 n) 3      # 3 adapts to f32
 ```
 
-Built-ins whose arguments must share a type, such as `min`, `max` and `clamp`, only coerce `num`s. Lists are never converted to arrays.
+A suffix can also follow a group, touching its `)`. `(expr):T` is exactly `T expr`.
+
+```qs
+(len xs):u32       # u32 (len xs)
+(a + b):f32        # f32 (a + b)
+```
+
+Built-ins only coerce `num`s. Built-ins whose arguments must share a type, such as `min`, `max` and `clamp`, never convert one typed argument to match another. Float-only built-ins, such as `pow`, `sin` and `sqrt`, reject typed integers, as in wgsl: `pow 2:i32 3` is an error, and the integer must be converted explicitly. Lists are never converted to arrays.
 
 A `num` converted to `i32` or `u32` must be a whole number. This is checked at compile time for constants and at runtime for host variables. Explicit conversions truncate.
 
@@ -460,7 +602,7 @@ Compiled js emulates wgsl's rules:
 | `i32`, `u32` | wrap on overflow |
 | integer `/` | truncates toward zero |
 | integer `/` by zero | evaluates to the left operand |
-| integer `mod` by zero | evaluates to `0` |
+| integer `mod` or `rem` by zero | evaluates to `0` |
 | float to integer | truncates, clamped to the type's range |
 
 Integer math and `f32` `+`, `-` and `*` match the GPU exactly. wgsl allows `f32` `/` and some built-ins to be slightly inexact, and GPUs may flush tiny values to zero, so those can differ in the last bits.
@@ -492,6 +634,8 @@ get d "name"       # d.name
 d.(k)              # computed key
 m.0.1              # column 0, component 1: digits after . are indexes
 ```
+
+On a dict, digits after `.` are a string key: `d.0` is `get d "0"`.
 
 Reading a missing key or an out-of-range list index is `nil`. Elements are changed with `set`, `push`, `pop` and `del`. Arrays have a fixed length, so `push` and `pop` on them are errors. There are no dict literals for now.
 
@@ -534,6 +678,8 @@ Inside a shader:
 | `sample tex uv` | filtered read |
 | `load tex coord` | exact texel read |
 
+`(0, 0)` is the top-left corner and y grows downward, as in WebGPU and in pointer events. `uv` is taken at the pixel's center: `coord + 0.5`, divided by the target's size in pixels. It never quite reaches 0 or 1. Pointer hooks use the same convention for `pos` and `uv`.
+
 `sample` takes an `f32`, `vec2f` or `vec3f` coordinate for `tex1d`, `tex2d` or `tex3d`; `load` takes a `u32`, `vec2u` or `vec3u`.
 
 Every language feature works in shaders, but every value must have one static type. This means the following are compile-time errors:
@@ -554,6 +700,23 @@ let gray (sh (target:tex2d src:tex2d) {
   let lum (fn (c:vec4f) (c.r * 0.3 + c.g * 0.59 + c.b * 0.11))
   let l (lum (sample src uv))
   vec4f l l l 1
+})
+```
+
+A shader can also use a script's top-level bindings, so helpers are written once and shared by the host and the GPU.
+
+- A top-level `fn` can be called from a shader if its body follows the shader rules. The rules for nested functions apply: its parameters must be typed, and it compiles to a wgsl helper function. The same function can still be called from host code.
+- A top-level typed value is captured as a uniform. It is read each time the shader is called, so a later `set` is seen by the next call.
+- Capturing any other value, including a `num`, is a compile-time error.
+
+```qs
+let lum (fn (c:vec4f) (c.r * 0.3 + c.g * 0.59 + c.b * 0.11))
+let strength 0.5:f32
+
+let gray (sh (target:tex2d src:tex2d) {
+  let c (sample src uv)
+  let l (lum c)
+  mix c (vec4f l l l 1) strength
 })
 ```
 
@@ -578,8 +741,8 @@ A script is either fetched from a URL or given directly as source text. An edito
 `on name handler` registers a function to run on an instance hook. `name` is a word and is not evaluated; `handler` is any expression that evaluates to a function.
 
 ```qs
-on ready (fn (e) ...)
-on update (fn (e) ...)
+on ready (fn (e) { ... })
+on update (fn (e) { ... })
 on render draw_frame       # draw_frame is passed, not called
 ```
 
@@ -609,14 +772,41 @@ Whoever controls an instance, from js or from qs, can inspect it:
 
 ## Modules and errors
 
-`import` evaluates a file once per scene and returns its top-level bindings as a dict. The path must be a string literal, so the engine can find and fetch every file a scene needs before running it, and `import` never waits. A path is resolved relative to the importing script.
+`import` evaluates a file once per scene and returns its top-level bindings as a dict. The path must be a string literal, so the engine can find and fetch every file a scene needs before running it, and `import` never waits. A path is resolved relative to the importing script and names the file exactly, including its extension. An import cycle, such as `a.qs` importing `b.qs` which imports `a.qs`, is a compile-time error.
 
 ```qs
-let m (import "path/to/file")
+let m (import "path/to/file.qs")
 m.helper 1 2
 ```
 
+The dict is live. Reading a field reads the module's current binding, and `set` on a field changes the module's binding, just as [Reflection](#reflection) allows. Every script that imports a module gets the same dict.
+
+```qs
+# counter.qs
+let count 0
+let bump (fn () (set count (count + 1)))
+
+# main.qs
+let m (import "counter.qs")
+m.bump
+m.count              # 1
+set m.count 5        # counter.qs now sees 5
+```
+
 A runtime error aborts the current script or callback, and the engine reports it. There is no try/catch.
+
+Type errors, such as `f32 + i32` or a value that does not match an annotation, are found as early as possible:
+
+- In shaders, every type error is a compile-time error.
+- On the host, a type error is a runtime error. It is also a compile-time error whenever the compiler can prove it, from literals, annotated bindings and annotated parameters. The host does not infer types beyond that, so an unannotated parameter is only checked when the function runs.
+
+```qs
+let add (fn (a b) (a + b))
+add 1:f32 2:i32          # runtime error
+
+let x:f32 1
+x + 2:i32                # compile-time error
+```
 
 ## Open questions
 
@@ -626,8 +816,13 @@ A runtime error aborts the current script or callback, and the engine reports it
 - Compiling in the page needs `new Function`, which a strict Content Security Policy blocks unless it allows `unsafe-eval`. Exporting a finished game as precompiled js would avoid this.
 - Letting the page's js give an instance extra functions (not needed for the prototype).
 - Structs and default parameter values.
+- Lone names as special-form operands. Under "arguments are never called", `while ready { ... }` tests the function `ready` itself, which is always truthy, and `return foo` returns the function. Keep this, warn about it, or call lone names in condition positions.
+- Whether a `let` annotation applies to later `set`s on the host, converting and checking each new value. In shaders a binding has one static type regardless.
 - The str and list library beyond `cat`.
 - Dict literals.
 - `set` past the end of a list, and `pop` on an empty list.
+- A dict key named `__type__`, which would make the dict load back as a typed value: reserve it, reserve every `__name__` key, or escape it when serializing.
+- Dict order. Plain js objects always put integer-like keys such as `"1"` first, in ascending order, so dicts cannot keep insertion order for them as currently promised.
 - Out-of-range array indexes (wgsl leaves this partly implementation-defined).
+- A shader whose target is also one of its texture arguments, such as `tint photo photo`. WebGPU cannot read and write one texture in the same pass, so this must be either an error or a hidden copy.
 - Whether qs code can raise its own errors.
